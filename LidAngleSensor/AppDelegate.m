@@ -7,45 +7,50 @@
 
 #import "AppDelegate.h"
 #import "LidAngleSensor.h"
-#import "CreakAudioEngine.h"
-#import "ThereminAudioEngine.h"
+#import "HarmoniumAudioEngine.h"
 #import "NSLabel.h"
-
-typedef NS_ENUM(NSInteger, AudioMode) {
-    AudioModeCreak,
-    AudioModeTheremin
-};
+#import "PianoKeyboardView.h"
+#import "BellowsMeterView.h"
+#import "BellowsDotsView.h"
+#import "HandDrawnCloseButton.h"
+#import <QuartzCore/QuartzCore.h>
 
 @interface AppDelegate ()
 @property (strong, nonatomic) LidAngleSensor *lidSensor;
-@property (strong, nonatomic) CreakAudioEngine *creakAudioEngine;
-@property (strong, nonatomic) ThereminAudioEngine *thereminAudioEngine;
-@property (strong, nonatomic) NSLabel *angleLabel;
-@property (strong, nonatomic) NSLabel *statusLabel;
-@property (strong, nonatomic) NSLabel *velocityLabel;
-@property (strong, nonatomic) NSLabel *audioStatusLabel;
+@property (strong, nonatomic) HarmoniumAudioEngine *harmoniumAudioEngine;
+// Removed info labels per request
 @property (strong, nonatomic) NSButton *audioToggleButton;
-@property (strong, nonatomic) NSSegmentedControl *modeSelector;
-@property (strong, nonatomic) NSLabel *modeLabel;
 @property (strong, nonatomic) NSTimer *updateTimer;
-@property (nonatomic, assign) AudioMode currentAudioMode;
+@property (strong, nonatomic) id keyDownMonitor;
+@property (strong, nonatomic) id keyUpMonitor;
+@property (strong, nonatomic) PianoKeyboardView *keyboardView;
+@property (strong, nonatomic) NSView *stopsColumn;
+@property (strong, nonatomic) BellowsMeterView *meterView; // kept but unused
+@property (strong, nonatomic) BellowsDotsView *dotsView;
+@property (strong, nonatomic) NSButton *muteButton;
+@property (assign, nonatomic) double fallbackPhase;
+@property (assign, nonatomic) CFTimeInterval lastDisplayUpdate;
 @end
 
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    self.currentAudioMode = AudioModeCreak; // Default to creak mode
     [self createWindow];
     [self initializeLidSensor];
     [self initializeAudioEngines];
+    [self installKeyboardMonitorsIfNeeded];
     [self startUpdatingDisplay];
+    // Auto-start audio so there is sound immediately
+    [self.harmoniumAudioEngine startEngine];
+    [self.audioToggleButton setTitle:@"Stop Audio"];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification {
     [self.updateTimer invalidate];
     [self.lidSensor stopLidAngleUpdates];
-    [self.creakAudioEngine stopEngine];
-    [self.thereminAudioEngine stopEngine];
+    [self.harmoniumAudioEngine stopEngine];
+    if (self.keyDownMonitor) { [NSEvent removeMonitor:self.keyDownMonitor]; self.keyDownMonitor = nil; }
+    if (self.keyUpMonitor) { [NSEvent removeMonitor:self.keyUpMonitor]; self.keyUpMonitor = nil; }
 }
 
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app {
@@ -53,47 +58,73 @@ typedef NS_ENUM(NSInteger, AudioMode) {
 }
 
 - (void)createWindow {
-    // Create the main window (taller to accommodate mode selection and audio controls)
-    NSRect windowFrame = NSMakeRect(100, 100, 450, 480);
+    // Harmonium sketch-like UI
+    NSRect windowFrame = NSMakeRect(100, 100, 820, 520);
     self.window = [[NSWindow alloc] initWithContentRect:windowFrame
-                                              styleMask:NSWindowStyleMaskTitled | 
-                                                       NSWindowStyleMaskClosable | 
+                                              styleMask:NSWindowStyleMaskTitled |
+                                                       NSWindowStyleMaskClosable |
                                                        NSWindowStyleMaskMiniaturizable
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
-    
-    [self.window setTitle:@"MacBook Lid Angle Sensor"];
+    [self.window setTitle:@"Laptop Harmonium"];
     [self.window makeKeyAndOrderFront:nil];
     [self.window center];
-    
-    // Create the content view
+    self.window.backgroundColor = [NSColor whiteColor];
+
     NSView *contentView = [[NSView alloc] initWithFrame:windowFrame];
     [self.window setContentView:contentView];
-    
-    // Create angle display label with tabular numbers (larger, light font)
-    self.angleLabel = [[NSLabel alloc] init];
-    [self.angleLabel setStringValue:@"Initializing..."];
-    [self.angleLabel setFont:[NSFont monospacedDigitSystemFontOfSize:48 weight:NSFontWeightLight]];
-    [self.angleLabel setAlignment:NSTextAlignmentCenter];
-    [self.angleLabel setTextColor:[NSColor systemBlueColor]];
-    [contentView addSubview:self.angleLabel];
-    
-    // Create velocity display label with tabular numbers
-    self.velocityLabel = [[NSLabel alloc] init];
-    [self.velocityLabel setStringValue:@"Velocity: 00 deg/s"];
-    [self.velocityLabel setFont:[NSFont monospacedDigitSystemFontOfSize:14 weight:NSFontWeightRegular]];
-    [self.velocityLabel setAlignment:NSTextAlignmentCenter];
-    [contentView addSubview:self.velocityLabel];
-    
-    // Create status label
-    self.statusLabel = [[NSLabel alloc] init];
-    [self.statusLabel setStringValue:@"Detecting sensor..."];
-    [self.statusLabel setFont:[NSFont systemFontOfSize:14]];
-    [self.statusLabel setAlignment:NSTextAlignmentCenter];
-    [self.statusLabel setTextColor:[NSColor secondaryLabelColor]];
-    [contentView addSubview:self.statusLabel];
-    
-    // Create audio toggle button
+
+    // Left: horizontal keyboard across bottom area
+    self.keyboardView = [[PianoKeyboardView alloc] initWithFrame:NSZeroRect];
+    self.keyboardView.translatesAutoresizingMaskIntoConstraints = NO;
+    __weak typeof(self) weakSelf = self;
+    self.keyboardView.noteEvent = ^(int midi, BOOL down) {
+        if (down) [weakSelf.harmoniumAudioEngine noteOn:midi];
+        else [weakSelf.harmoniumAudioEngine noteOff:midi];
+        // Update highlight state
+        NSMutableSet *set = [weakSelf.keyboardView.activeNotes mutableCopy] ?: [NSMutableSet set];
+        if (down) { [set addObject:@(midi)]; } else { [set removeObject:@(midi)]; }
+        weakSelf.keyboardView.activeNotes = set;
+    };
+    [contentView addSubview:self.keyboardView];
+
+    // Right: stops column (round buttons)
+    self.stopsColumn = [[NSView alloc] initWithFrame:NSZeroRect];
+    self.stopsColumn.translatesAutoresizingMaskIntoConstraints = NO;
+    [contentView addSubview:self.stopsColumn];
+
+    NSArray<NSString *> *stopNames = @[ @"Bright", @"Warm", @"Octave", @"Chorus", @"Dry", @"Air" ];
+    NSMutableArray<NSButton *> *stopButtons = [NSMutableArray array];
+    for (NSString *name in stopNames) {
+        NSButton *btn = [NSButton buttonWithTitle:@"" target:nil action:nil];
+    btn.bezelStyle = NSBezelStyleCircular;
+        btn.translatesAutoresizingMaskIntoConstraints = NO;
+        btn.toolTip = name;
+    [btn setButtonType:NSButtonTypeSwitch];
+        [self.stopsColumn addSubview:btn];
+        [stopButtons addObject:btn];
+    }
+
+    // Top-right hand-drawn close (X) control and a mute
+    HandDrawnCloseButton *closeButton = [[HandDrawnCloseButton alloc] initWithFrame:NSZeroRect];
+    closeButton.target = self; closeButton.action = @selector(closeApp:);
+    closeButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [contentView addSubview:closeButton];
+
+    self.muteButton = [NSButton buttonWithTitle:@"✕" target:self action:@selector(toggleAudio:)];
+    self.muteButton.bezelStyle = NSBezelStyleTexturedRounded;
+    self.muteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [contentView addSubview:self.muteButton];
+
+    // Bellows dots above the keyboard
+    self.dotsView = [[BellowsDotsView alloc] initWithFrame:NSZeroRect];
+    self.dotsView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.dotsView.count = 8;
+    [contentView addSubview:self.dotsView];
+
+    // No angle/status labels
+
+    // Start/Stop button (also keyboard shortcut)
     self.audioToggleButton = [[NSButton alloc] init];
     [self.audioToggleButton setTitle:@"Start Audio"];
     [self.audioToggleButton setBezelStyle:NSBezelStyleRounded];
@@ -101,227 +132,167 @@ typedef NS_ENUM(NSInteger, AudioMode) {
     [self.audioToggleButton setAction:@selector(toggleAudio:)];
     [self.audioToggleButton setTranslatesAutoresizingMaskIntoConstraints:NO];
     [contentView addSubview:self.audioToggleButton];
-    
-    // Create audio status label
-    self.audioStatusLabel = [[NSLabel alloc] init];
-    [self.audioStatusLabel setStringValue:@""];
-    [self.audioStatusLabel setFont:[NSFont systemFontOfSize:14]];
-    [self.audioStatusLabel setAlignment:NSTextAlignmentCenter];
-    [self.audioStatusLabel setTextColor:[NSColor secondaryLabelColor]];
-    [contentView addSubview:self.audioStatusLabel];
-    
-    // Create mode label
-    self.modeLabel = [[NSLabel alloc] init];
-    [self.modeLabel setStringValue:@"Audio Mode:"];
-    [self.modeLabel setFont:[NSFont systemFontOfSize:14 weight:NSFontWeightMedium]];
-    [self.modeLabel setAlignment:NSTextAlignmentCenter];
-    [self.modeLabel setTextColor:[NSColor labelColor]];
-    [contentView addSubview:self.modeLabel];
-    
-    // Create mode selector
-    self.modeSelector = [[NSSegmentedControl alloc] init];
-    [self.modeSelector setSegmentCount:2];
-    [self.modeSelector setLabel:@"Creak" forSegment:0];
-    [self.modeSelector setLabel:@"Theremin" forSegment:1];
-    [self.modeSelector setSelectedSegment:0]; // Default to creak
-    [self.modeSelector setTarget:self];
-    [self.modeSelector setAction:@selector(modeChanged:)];
-    [self.modeSelector setTranslatesAutoresizingMaskIntoConstraints:NO];
-    [contentView addSubview:self.modeSelector];
-    
-    // Set up auto layout constraints
+
+    // Remove info labels; no instructions or angle/status
+
+    // Layout
+    NSLayoutConstraint *kbLeft = [self.keyboardView.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:24];
+    NSLayoutConstraint *kbRight = [self.keyboardView.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-24];
+    NSLayoutConstraint *kbBottom = [self.keyboardView.bottomAnchor constraintEqualToAnchor:contentView.bottomAnchor constant:-24];
+    NSLayoutConstraint *kbHeight = [self.keyboardView.heightAnchor constraintEqualToConstant:140];
+
+    NSMutableArray *stopConstraints = [NSMutableArray array];
+    NSView *prev = nil;
+    for (NSView *btn in self.stopsColumn.subviews) {
+        [stopConstraints addObject:[btn.centerXAnchor constraintEqualToAnchor:self.stopsColumn.centerXAnchor]];
+        [stopConstraints addObject:[btn.widthAnchor constraintEqualToConstant:36]];
+        [stopConstraints addObject:[btn.heightAnchor constraintEqualToConstant:36]];
+        if (!prev) {
+            [stopConstraints addObject:[btn.topAnchor constraintEqualToAnchor:self.stopsColumn.topAnchor constant:24]];
+        } else {
+            [stopConstraints addObject:[btn.topAnchor constraintEqualToAnchor:prev.bottomAnchor constant:18]];
+        }
+        prev = btn;
+    }
+
     [NSLayoutConstraint activateConstraints:@[
-        // Angle label (main display, now at top)
-        [self.angleLabel.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:40],
-        [self.angleLabel.centerXAnchor constraintEqualToAnchor:contentView.centerXAnchor],
-        [self.angleLabel.widthAnchor constraintLessThanOrEqualToAnchor:contentView.widthAnchor constant:-40],
+    kbLeft, kbRight, kbBottom, kbHeight,
+
+        // Stops column to the right of keyboard
+        [self.stopsColumn.leadingAnchor constraintEqualToAnchor:self.keyboardView.trailingAnchor constant:24],
+        [self.stopsColumn.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:24],
+        [self.stopsColumn.widthAnchor constraintEqualToConstant:80],
+        [self.stopsColumn.bottomAnchor constraintLessThanOrEqualToAnchor:contentView.bottomAnchor constant:-24],
+    ]];
+    [NSLayoutConstraint activateConstraints:stopConstraints];
+
+    [NSLayoutConstraint activateConstraints:@[
+    // Top-right close and mute
+    [closeButton.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:10],
+    [closeButton.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-10],
+    [self.muteButton.centerYAnchor constraintEqualToAnchor:closeButton.centerYAnchor],
+    [self.muteButton.trailingAnchor constraintEqualToAnchor:closeButton.leadingAnchor constant:-8],
         
-        // Velocity label
-        [self.velocityLabel.topAnchor constraintEqualToAnchor:self.angleLabel.bottomAnchor constant:15],
-        [self.velocityLabel.centerXAnchor constraintEqualToAnchor:contentView.centerXAnchor],
-        [self.velocityLabel.widthAnchor constraintLessThanOrEqualToAnchor:contentView.widthAnchor constant:-40],
-        
-        // Status label
-        [self.statusLabel.topAnchor constraintEqualToAnchor:self.velocityLabel.bottomAnchor constant:15],
-        [self.statusLabel.centerXAnchor constraintEqualToAnchor:contentView.centerXAnchor],
-        [self.statusLabel.widthAnchor constraintLessThanOrEqualToAnchor:contentView.widthAnchor constant:-40],
-        
-        // Audio toggle button
-        [self.audioToggleButton.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:25],
-        [self.audioToggleButton.centerXAnchor constraintEqualToAnchor:contentView.centerXAnchor],
+        // Dots centered above keyboard
+        [self.dotsView.centerXAnchor constraintEqualToAnchor:self.keyboardView.centerXAnchor],
+        [self.dotsView.bottomAnchor constraintEqualToAnchor:self.keyboardView.topAnchor constant:-12],
+        [self.dotsView.widthAnchor constraintEqualToAnchor:self.keyboardView.widthAnchor multiplier:0.6],
+        [self.dotsView.heightAnchor constraintEqualToConstant:40],
+
+        // Info stack centered horizontally between stops and meter
+    [self.audioToggleButton.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:24],
+    [self.audioToggleButton.leadingAnchor constraintEqualToAnchor:self.stopsColumn.trailingAnchor constant:24],
         [self.audioToggleButton.widthAnchor constraintEqualToConstant:120],
         [self.audioToggleButton.heightAnchor constraintEqualToConstant:32],
-        
-        // Audio status label
-        [self.audioStatusLabel.topAnchor constraintEqualToAnchor:self.audioToggleButton.bottomAnchor constant:15],
-        [self.audioStatusLabel.centerXAnchor constraintEqualToAnchor:contentView.centerXAnchor],
-        [self.audioStatusLabel.widthAnchor constraintLessThanOrEqualToAnchor:contentView.widthAnchor constant:-40],
-        
-        // Mode label
-        [self.modeLabel.topAnchor constraintEqualToAnchor:self.audioStatusLabel.bottomAnchor constant:25],
-        [self.modeLabel.centerXAnchor constraintEqualToAnchor:contentView.centerXAnchor],
-        [self.modeLabel.widthAnchor constraintLessThanOrEqualToAnchor:contentView.widthAnchor constant:-40],
-        
-        // Mode selector
-        [self.modeSelector.topAnchor constraintEqualToAnchor:self.modeLabel.bottomAnchor constant:10],
-        [self.modeSelector.centerXAnchor constraintEqualToAnchor:contentView.centerXAnchor],
-        [self.modeSelector.widthAnchor constraintEqualToConstant:200],
-        [self.modeSelector.heightAnchor constraintEqualToConstant:28],
-        [self.modeSelector.bottomAnchor constraintLessThanOrEqualToAnchor:contentView.bottomAnchor constant:-20]
     ]];
 }
 
 - (void)initializeLidSensor {
     self.lidSensor = [[LidAngleSensor alloc] init];
-    
-    if (self.lidSensor.isAvailable) {
-        [self.statusLabel setStringValue:@"Sensor detected - Reading angle..."];
-        [self.statusLabel setTextColor:[NSColor systemGreenColor]];
-    } else {
-        [self.statusLabel setStringValue:@"Lid angle sensor not available on this device"];
-        [self.statusLabel setTextColor:[NSColor systemRedColor]];
-        [self.angleLabel setStringValue:@"Not Available"];
-        [self.angleLabel setTextColor:[NSColor systemRedColor]];
-    }
+    (void)self.lidSensor; // no-op UI
 }
 
 - (void)initializeAudioEngines {
-    self.creakAudioEngine = [[CreakAudioEngine alloc] init];
-    self.thereminAudioEngine = [[ThereminAudioEngine alloc] init];
-    
-    if (self.creakAudioEngine && self.thereminAudioEngine) {
-        [self.audioStatusLabel setStringValue:@""];
-    } else {
-        [self.audioStatusLabel setStringValue:@"Audio initialization failed"];
-        [self.audioStatusLabel setTextColor:[NSColor systemRedColor]];
+    self.harmoniumAudioEngine = [[HarmoniumAudioEngine alloc] init];
+    if (!self.harmoniumAudioEngine) {
         [self.audioToggleButton setEnabled:NO];
     }
 }
 
+- (NSNumber *)midiForKey:(unichar)c {
+    static NSDictionary<NSNumber*, NSNumber*> *map;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        map = @{
+            @('z'): @(60), @('s'): @(61), @('x'): @(62), @('d'): @(63), @('c'): @(64), @('v'): @(65), @('g'): @(66), @('b'): @(67), @('h'): @(68), @('n'): @(69), @('j'): @(70), @('m'): @(71), @(','): @(72),
+            @('q'): @(72), @('2'): @(73), @('w'): @(74), @('3'): @(75), @('e'): @(76), @('r'): @(77), @('5'): @(78), @('t'): @(79), @('6'): @(80), @('y'): @(81), @('7'): @(82), @('u'): @(83), @('i'): @(84)
+        };
+    });
+    return map[@(tolower(c))];
+}
+
+- (void)installKeyboardMonitorsIfNeeded {
+    if (self.keyDownMonitor) { [NSEvent removeMonitor:self.keyDownMonitor]; self.keyDownMonitor = nil; }
+    if (self.keyUpMonitor) { [NSEvent removeMonitor:self.keyUpMonitor]; self.keyUpMonitor = nil; }
+    __weak typeof(self) weakSelf = self;
+    self.keyDownMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent * _Nullable(NSEvent * _Nonnull event) {
+        BOOL handled = NO;
+        for (NSUInteger i = 0; i < event.characters.length; i++) {
+            unichar c = [event.characters characterAtIndex:i];
+            NSNumber *n = [weakSelf midiForKey:c];
+            if (n) {
+                [weakSelf.harmoniumAudioEngine noteOn:n.intValue];
+                NSMutableSet *set = [weakSelf.keyboardView.activeNotes mutableCopy] ?: [NSMutableSet set];
+                [set addObject:n];
+                weakSelf.keyboardView.activeNotes = set;
+                handled = YES;
+            }
+        }
+        return handled ? nil : event;
+    }];
+    self.keyUpMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyUp handler:^NSEvent * _Nullable(NSEvent * _Nonnull event) {
+        BOOL handled = NO;
+        for (NSUInteger i = 0; i < event.characters.length; i++) {
+            unichar c = [event.characters characterAtIndex:i];
+            NSNumber *n = [weakSelf midiForKey:c];
+            if (n) {
+                [weakSelf.harmoniumAudioEngine noteOff:n.intValue];
+                NSMutableSet *set = [weakSelf.keyboardView.activeNotes mutableCopy] ?: [NSMutableSet set];
+                [set removeObject:n];
+                weakSelf.keyboardView.activeNotes = set;
+                handled = YES;
+            }
+        }
+        return handled ? nil : event;
+    }];
+}
+
 - (IBAction)toggleAudio:(id)sender {
-    id currentEngine = [self currentAudioEngine];
-    if (!currentEngine) {
-        return;
-    }
-    
-    if ([currentEngine isEngineRunning]) {
-        [currentEngine stopEngine];
-        [self.audioToggleButton setTitle:@"Start Audio"];
-        [self.audioStatusLabel setStringValue:@""];
+    if ([self.harmoniumAudioEngine isEngineRunning]) {
+        [self.harmoniumAudioEngine stopEngine];
+    [self.audioToggleButton setTitle:@"Start Audio"];
     } else {
-        [currentEngine startEngine];
-        [self.audioToggleButton setTitle:@"Stop Audio"];
-        [self.audioStatusLabel setStringValue:@""];
+        [self.harmoniumAudioEngine startEngine];
+    [self.audioToggleButton setTitle:@"Stop Audio"];
     }
 }
 
-- (IBAction)modeChanged:(id)sender {
-    NSSegmentedControl *control = (NSSegmentedControl *)sender;
-    AudioMode newMode = (AudioMode)control.selectedSegment;
-    
-    // Stop current engine if running
-    id currentEngine = [self currentAudioEngine];
-    BOOL wasRunning = [currentEngine isEngineRunning];
-    if (wasRunning) {
-        [currentEngine stopEngine];
-    }
-    
-    // Update mode
-    self.currentAudioMode = newMode;
-    
-    // Start new engine if the previous one was running
-    if (wasRunning) {
-        id newEngine = [self currentAudioEngine];
-        [newEngine startEngine];
-        [self.audioToggleButton setTitle:@"Stop Audio"];
-    } else {
-        [self.audioToggleButton setTitle:@"Start Audio"];
-    }
-    
-    [self.audioStatusLabel setStringValue:@""];
-}
-
-- (id)currentAudioEngine {
-    switch (self.currentAudioMode) {
-        case AudioModeCreak:
-            return self.creakAudioEngine;
-        case AudioModeTheremin:
-            return self.thereminAudioEngine;
-        default:
-            return self.creakAudioEngine;
-    }
+- (IBAction)closeApp:(id)sender {
+    [NSApp terminate:self];
 }
 
 - (void)startUpdatingDisplay {
-    // Update every 16ms (60Hz) for smooth real-time audio and display updates
     self.updateTimer = [NSTimer scheduledTimerWithTimeInterval:0.016
                                                         target:self
                                                       selector:@selector(updateAngleDisplay)
                                                       userInfo:nil
                                                        repeats:YES];
+    self.lastDisplayUpdate = CACurrentMediaTime();
 }
 
 - (void)updateAngleDisplay {
-    if (!self.lidSensor.isAvailable) {
-        return;
-    }
-    
-    double angle = [self.lidSensor lidAngle];
-    
-    if (angle == -2.0) {
-        [self.angleLabel setStringValue:@"Read Error"];
-        [self.angleLabel setTextColor:[NSColor systemOrangeColor]];
-        [self.statusLabel setStringValue:@"Failed to read sensor data"];
-        [self.statusLabel setTextColor:[NSColor systemOrangeColor]];
-    } else {
-        [self.angleLabel setStringValue:[NSString stringWithFormat:@"%.1f°", angle]];
-        [self.angleLabel setTextColor:[NSColor systemBlueColor]];
-        
-        // Update current audio engine with new angle
-        id currentEngine = [self currentAudioEngine];
-        if (currentEngine) {
-            [currentEngine updateWithLidAngle:angle];
-            
-            // Update velocity display with leading zero and whole numbers
-            double velocity = [currentEngine currentVelocity];
-            int roundedVelocity = (int)round(velocity);
-            if (roundedVelocity < 100) {
-                [self.velocityLabel setStringValue:[NSString stringWithFormat:@"Velocity: %02d deg/s", roundedVelocity]];
-            } else {
-                [self.velocityLabel setStringValue:[NSString stringWithFormat:@"Velocity: %d deg/s", roundedVelocity]];
-            }
-            
-            // Show audio parameters when running
-            if ([currentEngine isEngineRunning]) {
-                if (self.currentAudioMode == AudioModeCreak) {
-                    double gain = [currentEngine currentGain];
-                    double rate = [currentEngine currentRate];
-                    [self.audioStatusLabel setStringValue:[NSString stringWithFormat:@"Gain: %.2f, Rate: %.2f", gain, rate]];
-                } else if (self.currentAudioMode == AudioModeTheremin) {
-                    double frequency = [currentEngine currentFrequency];
-                    double volume = [currentEngine currentVolume];
-                    [self.audioStatusLabel setStringValue:[NSString stringWithFormat:@"Freq: %.1f Hz, Vol: %.2f", frequency, volume]];
-                }
-            }
-        }
-        
-        // Provide contextual status based on angle
-        NSString *status;
-        if (angle < 5.0) {
-            status = @"Lid is closed";
-        } else if (angle < 45.0) {
-            status = @"Lid slightly open";
-        } else if (angle < 90.0) {
-            status = @"Lid partially open";
-        } else if (angle < 120.0) {
-            status = @"Lid mostly open";
+    double now = CACurrentMediaTime();
+    double dt = now - self.lastDisplayUpdate; if (dt < 0 || dt > 1.0) dt = 0.016; // guard
+    self.lastDisplayUpdate = now;
+
+    BOOL haveSensor = self.lidSensor.isAvailable;
+    double angle = haveSensor ? [self.lidSensor lidAngle] : -2.0;
+
+    if (!haveSensor || angle == -2.0) {
+        // Fallback: always tick engine so pressure can decay to zero.
+        if ([self.harmoniumAudioEngine activeNoteCount] > 0) {
+            self.fallbackPhase += dt * (1.5 * 2.0 * M_PI); // 1.5 Hz
+            double simAngle = 60.0 + 10.0 * sin(self.fallbackPhase);
+            [self.harmoniumAudioEngine updateWithLidAngle:simAngle];
         } else {
-            status = @"Lid fully open";
+            // Use a constant angle to indicate no movement; engine will decay pressure.
+            [self.harmoniumAudioEngine updateWithLidAngle:0.0];
         }
-        
-        [self.statusLabel setStringValue:status];
-        [self.statusLabel setTextColor:[NSColor secondaryLabelColor]];
+    } else {
+        [self.harmoniumAudioEngine updateWithLidAngle:angle];
     }
+
+    self.dotsView.pressure = [self.harmoniumAudioEngine currentPressure];
 }
 
 @end
