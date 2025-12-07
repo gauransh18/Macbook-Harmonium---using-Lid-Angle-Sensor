@@ -1,2 +1,18 @@
 /build
 .DS_Store
+# Xcode
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcuserdatad/
+
+# Workspaces
+*.xcworkspace/xcuserdata/
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log

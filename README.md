@@ -57,6 +57,17 @@ LEGO Batman 3: Beyond Gotham. But you knew that already.
 
 Yes, never click "Start Audio". But this energy isn't encouraged.
 
+## Harmonium mode (new)
+
+Turn your laptop into a little pump organ:
+
+- Select "Harmonium" in the mode switch, then click "Start Audio".
+- Play notes with your keyboard: use Z/S/X/D/C/V/G/B/H/N/J/M/, for C4 chromatic upward; Q/2/W/3/E/R/5/T/6/Y/7/U/I for the next octave.
+- Move the lid to act as bellows: slow, steady lid movement increases pressure (volume); when you stop, pressure slowly decays.
+- Status shows Bellows (0–1) and Notes (active polyphony). 
+
+Tip: small, rhythmic lid motions give a nice "breath" to sustained chords.
+
 ## Building
 
 According to [this issue](https://github.com/samhenrigold/LidAngleSensor/issues/12), building requires having Xcode installed. I've only tested this on Xcode 26. YMMV.
